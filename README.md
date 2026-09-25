@@ -31,9 +31,9 @@ Using S=42, K=40, T=0.5, r=0.1, sigma=0.2:
 
 ## Extensions: Testing the Model on Real Market Data (Python)
 
-The [`python-analysis/`](python-analysis/) folder ports the same formulas to Python and tests them against live Apple (AAPL) stock and option prices from Yahoo Finance. It includes a numerical solver that backs out *implied volatility*: the volatility traders are pricing in, rather than the volatility the stock has shown in the past.
+The [`python-analysis/`](python-analysis/) folder ports the same formulas to Python, adds dividends, and tests the model against live Apple (AAPL) call and put prices from Yahoo Finance. It includes a numerical solver that backs out *implied volatility*: the volatility traders are pricing in, rather than the volatility the stock has shown in the past.
 
-**Finding (24 Sep 2026):** AAPL's at-the-money implied volatility is **22.8%** vs **24.6%** historical (1-year), suggesting the market expects **less** movement over the next month than the stock showed over the past year. Using historical volatility, the model priced 20 call options within an average of $0.52 of the market. Implied volatility also rises steadily for lower strikes (a "volatility skew"), a well-known way real markets depart from the model's constant-volatility assumption.
+**Finding (24 Sep 2026):** AAPL's at-the-money implied volatility is about **22.5%** (calls 22.9%, puts 22.1%) vs **24.6%** historical (1-year), suggesting the market expects **less** movement over the next month than the stock showed over the past year. Using historical volatility, the model priced 20 calls and 18 puts within an average of about $0.50 of the market. Implied volatility also rises steadily for lower strikes (a "volatility skew"), a well-known way real markets depart from the model's constant-volatility assumption.
 
 See [`python-analysis/README.md`](python-analysis/README.md) for the charts and method.
 

@@ -1,0 +1,2 @@
+date,ticker,stock_price,dividend_yield,risk_free_rate,expiry,days_to_expiry,hv_1y,hv_30d,atm_iv_call,atm_iv_put,mean_abs_error_call,mean_abs_error_put
+2026-09-24,AAPL,335.920013,0.003156,0.040680,2026-10-23,29,0.245669,0.202718,0.228963,0.220961,0.522099,0.483631

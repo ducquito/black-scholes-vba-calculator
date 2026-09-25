@@ -2,13 +2,14 @@
 Validate the Black-Scholes model against real market data.
 
 Steps:
-  1. Download one year of daily stock prices (yfinance, free)
-  2. Estimate historical volatility from those prices
-  3. Download a real option chain for an expiry ~1 month out
-  4. Price each call with Black-Scholes using historical volatility
+  1. Download one year of daily stock prices and dividends (yfinance, free)
+  2. Estimate historical volatility and dividend yield from that data
+  3. Download a real option chain (calls and puts) for an expiry ~1 month out
+  4. Price each option with Black-Scholes using historical volatility
      and compare to what the market is actually charging
   5. Back out the implied volatility from each market price
-  6. Save charts to plots/ and a results table to results.csv
+  6. Save charts to plots/, today's option table to results.csv, and append
+     one summary row per trading day to history.csv
 
 Usage:
     python analysis.py            # defaults to AAPL
@@ -16,7 +17,7 @@ Usage:
 """
 
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import matplotlib
@@ -26,7 +27,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from black_scholes import call_price, call_delta, implied_vol
+from black_scholes import call_price, put_price, call_delta, put_delta, implied_vol
 
 TICKER = sys.argv[1].upper() if len(sys.argv) > 1 else "AAPL"
 TARGET_DAYS = 30          # pick the expiry closest to ~1 month out
@@ -36,6 +37,9 @@ TRADING_DAYS = 252
 
 OUT_DIR = Path(__file__).parent
 PLOT_DIR = OUT_DIR / "plots"
+HISTORY_FILE = OUT_DIR / "history.csv"
+
+PRICERS = {"call": (call_price, call_delta), "put": (put_price, put_delta)}
 
 # Chart colors (light theme, colorblind-checked categorical order)
 BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
@@ -43,15 +47,6 @@ INK, INK_2, MUTED, GRID = "#0b0b0b", "#52514e", "#898781", "#e1e0d9"
 
 
 # ---------------------------------------------------------------- data
-
-def risk_free_rate():
-    """13-week US T-bill yield (Yahoo symbol ^IRX, quoted in percent)."""
-    try:
-        irx = yf.Ticker("^IRX").history(period="5d")["Close"].dropna()
-        return float(irx.iloc[-1]) / 100, "13-week T-bill (^IRX)"
-    except Exception:
-        return FALLBACK_RATE, "fixed estimate"
-
 
 def current_price(stock, hist):
     """
@@ -65,6 +60,35 @@ def current_price(stock, hist):
     except Exception:
         pass
     return float(hist["Close"].iloc[-1])
+
+
+def market_date(stock):
+    """Date of the latest trading session, so re-runs on the same day overwrite one row."""
+    try:
+        return datetime.fromtimestamp(stock.info["regularMarketTime"]).date()
+    except Exception:
+        return date.today()
+
+
+def risk_free_rate():
+    """13-week US T-bill yield (Yahoo symbol ^IRX, quoted in percent)."""
+    try:
+        irx = yf.Ticker("^IRX").history(period="5d")["Close"].dropna()
+        return float(irx.iloc[-1]) / 100, "13-week T-bill (^IRX)"
+    except Exception:
+        return FALLBACK_RATE, "fixed estimate"
+
+
+def dividend_yield(stock, S):
+    """
+    Trailing 12-month dividends divided by the stock price, e.g. four
+    quarterly payments of $0.27 on a $336 stock is about 0.32% a year.
+    """
+    divs = stock.dividends
+    if divs.empty:
+        return 0.0
+    cutoff = pd.Timestamp.now(tz=divs.index.tz) - timedelta(days=365)
+    return float(divs[divs.index > cutoff].sum()) / S
 
 
 def historical_volatility(close, window=None):
@@ -93,6 +117,46 @@ def market_price(row):
     return row["lastPrice"], "last"
 
 
+def analyze_chain(chain, kind, S, T, r, q, hv):
+    """Model price, pricing error and implied vol for each liquid strike."""
+    pricer, delta = PRICERS[kind]
+
+    # Keep liquid strikes near the current price; far out-of-the-money and
+    # deep in-the-money quotes are sparse and noisy
+    df = chain[(chain["strike"] >= S * (1 - MONEYNESS_BAND)) &
+               (chain["strike"] <= S * (1 + MONEYNESS_BAND)) &
+               (chain["openInterest"].fillna(0) > 0)].copy()
+    if df.empty:
+        return df
+    df[["market", "price_source"]] = df.apply(market_price, axis=1, result_type="expand")
+    df = df[df["market"] > 0]
+
+    df["bs_hist_vol"] = pricer(S, df["strike"], T, r, hv, q)
+    df["diff"] = df["market"] - df["bs_hist_vol"]
+    df["delta"] = delta(S, df["strike"], T, r, hv, q)
+    df["iv_solved"] = [implied_vol(p, S, k, T, r, kind, q)
+                       for p, k in zip(df["market"], df["strike"])]
+    df["iv_yahoo"] = df["impliedVolatility"]
+    df.insert(0, "type", kind)
+    return df[["type", "strike", "market", "price_source", "bs_hist_vol", "diff", "delta",
+               "iv_solved", "iv_yahoo", "volume", "openInterest"]].reset_index(drop=True)
+
+
+def atm_iv(df, S):
+    """At-the-money implied vol: average of the two strikes closest to the stock price."""
+    return df.iloc[(df["strike"] - S).abs().argsort()[:2]]["iv_solved"].mean()
+
+
+def log_history(row):
+    """One row per trading day; re-running on the same day replaces that day's row."""
+    new = pd.DataFrame([row])
+    if HISTORY_FILE.exists():
+        old = pd.read_csv(HISTORY_FILE, dtype={"date": str})
+        old = old[~((old["date"] == row["date"]) & (old["ticker"] == row["ticker"]))]
+        new = pd.concat([old, new], ignore_index=True).sort_values(["ticker", "date"])
+    new.to_csv(HISTORY_FILE, index=False, float_format="%.6f")
+
+
 # ---------------------------------------------------------------- charts
 
 def style_axes(ax, title, xlabel, ylabel):
@@ -108,6 +172,11 @@ def style_axes(ax, title, xlabel, ylabel):
     ax.tick_params(colors=MUTED)
 
 
+def mark_stock_price(ax, S):
+    ax.axvline(S, color=MUTED, linewidth=1, linestyle="--")
+    ax.text(S, ax.get_ylim()[1], f" stock ${S:.2f}", color=INK_2, va="top", fontsize=9)
+
+
 def plot_price_history(hist):
     fig, ax = plt.subplots(figsize=(9, 4.5))
     ax.plot(hist.index, hist["Close"], color=BLUE, linewidth=2)
@@ -117,16 +186,17 @@ def plot_price_history(hist):
     plt.close(fig)
 
 
-def plot_theoretical_vs_market(df, S, hv):
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    ax.plot(df["strike"], df["market"], color=BLUE, linewidth=2, marker="o",
-            markersize=4, label="Market price")
-    ax.plot(df["strike"], df["bs_hist_vol"], color=ORANGE, linewidth=2, marker="o",
-            markersize=4, label=f"Black-Scholes with historical vol ({hv:.1%})")
-    ax.axvline(S, color=MUTED, linewidth=1, linestyle="--")
-    ax.text(S, ax.get_ylim()[1], f" stock ${S:.2f}", color=INK_2, va="top", fontsize=9)
-    style_axes(ax, f"{TICKER} call prices: model vs market", "Strike ($)", "Call price ($)")
-    ax.legend(frameon=False)
+def plot_theoretical_vs_market(calls, puts, S, hv):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+    for ax, df, name in ((axes[0], calls, "Calls"), (axes[1], puts, "Puts")):
+        ax.plot(df["strike"], df["market"], color=BLUE, linewidth=2, marker="o",
+                markersize=4, label="Market price")
+        ax.plot(df["strike"], df["bs_hist_vol"], color=ORANGE, linewidth=2, marker="o",
+                markersize=4, label=f"Black-Scholes, historical vol ({hv:.1%})")
+        style_axes(ax, f"{TICKER} {name.lower()}: model vs market", "Strike ($)",
+                   "Option price ($)" if name == "Calls" else "")
+        mark_stock_price(ax, S)
+    axes[0].legend(frameon=False, loc="upper right", bbox_to_anchor=(1, 0.85))
     fig.tight_layout()
     fig.savefig(PLOT_DIR / "2_theoretical_vs_market.png", dpi=150)
     plt.close(fig)
@@ -147,20 +217,44 @@ def plot_vol_comparison(vols):
     plt.close(fig)
 
 
-def plot_vol_skew(df, S, hv):
+def plot_vol_skew(calls, puts, S, hv):
     fig, ax = plt.subplots(figsize=(9, 4.5))
-    ax.plot(df["strike"], df["iv_solved"], color=BLUE, linewidth=2, marker="o",
-            markersize=4, label="Implied vol (our solver)")
-    ax.plot(df["strike"], df["iv_yahoo"], color=AQUA, linewidth=2, linestyle=":",
-            label="Implied vol (Yahoo Finance)")
+    ax.plot(calls["strike"], calls["iv_solved"], color=BLUE, linewidth=2, marker="o",
+            markersize=4, label="Implied vol, calls")
+    ax.plot(puts["strike"], puts["iv_solved"], color=AQUA, linewidth=2, marker="o",
+            markersize=4, label="Implied vol, puts")
     ax.axhline(hv, color=ORANGE, linewidth=2, label=f"Historical vol, 1 year ({hv:.1%})")
-    ax.axvline(S, color=MUTED, linewidth=1, linestyle="--")
     ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
     style_axes(ax, f"{TICKER} implied volatility by strike (the 'skew')",
                "Strike ($)", "Annualized volatility")
+    mark_stock_price(ax, S)
     ax.legend(frameon=False)
     fig.tight_layout()
     fig.savefig(PLOT_DIR / "4_volatility_skew.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_history():
+    """Implied vs historical vol across the days logged so far (needs 2+ days)."""
+    hist = pd.read_csv(HISTORY_FILE, parse_dates=["date"])
+    hist = hist[hist["ticker"] == TICKER]
+    if len(hist) < 2:
+        return
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.plot(hist["date"], hist["atm_iv_call"], color=BLUE, linewidth=2, marker="o",
+            markersize=6, label="Implied vol, ATM calls")
+    ax.plot(hist["date"], hist["atm_iv_put"], color=AQUA, linewidth=2, marker="o",
+            markersize=6, label="Implied vol, ATM puts")
+    ax.plot(hist["date"], hist["hv_1y"], color=ORANGE, linewidth=2, marker="o",
+            markersize=6, label="Historical vol, 1 year")
+    ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
+    ax.xaxis.set_major_formatter(matplotlib.dates.DateFormatter("%b %d"))
+    ax.set_xticks(hist["date"])
+    style_axes(ax, f"{TICKER} implied vs historical volatility, day by day", "",
+               "Annualized volatility")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(PLOT_DIR / "5_daily_history.png", dpi=150)
     plt.close(fig)
 
 
@@ -171,84 +265,75 @@ def main():
     today = date.today()
     stock = yf.Ticker(TICKER)
 
-    # 1. Price history and current price
-    # Yahoo sometimes returns today's row with a blank close while the day's
-    # bar is still being built, so drop incomplete rows
+    # 1. Price history and current price. Yahoo sometimes returns today's row
+    # with a blank close while the day's bar is still being built, so drop
+    # incomplete rows
     hist = stock.history(period="1y").dropna(subset=["Close"])
     S = current_price(stock, hist)
 
-    # 2. Historical volatility: full year, and last 30 trading days
+    # 2. Historical volatility (full year and last 30 trading days) and dividends
     hv_1y = historical_volatility(hist["Close"])
     hv_30d = historical_volatility(hist["Close"], window=30)
-
+    q = dividend_yield(stock, S)
     r, r_source = risk_free_rate()
 
     # 3. Option chain for the expiry closest to one month out
     expiry, days = pick_expiry(stock.options, today)
     T = days / 365
-    calls = stock.option_chain(expiry).calls
+    chain = stock.option_chain(expiry)
 
-    # Keep liquid strikes near the current price; far out-of-the-money and
-    # deep in-the-money quotes are sparse and noisy
-    calls = calls[(calls["strike"] >= S * (1 - MONEYNESS_BAND)) &
-                  (calls["strike"] <= S * (1 + MONEYNESS_BAND)) &
-                  (calls["openInterest"].fillna(0) > 0)].copy()
-    if calls.empty:
-        sys.exit(f"No liquid {TICKER} calls near ${S:.2f} for {expiry}.")
-    calls[["market", "price_source"]] = calls.apply(market_price, axis=1, result_type="expand")
-    calls = calls[calls["market"] > 0]
+    # 4-5. Model vs market and implied vol, for calls and puts
+    calls = analyze_chain(chain.calls, "call", S, T, r, q, hv_1y)
+    puts = analyze_chain(chain.puts, "put", S, T, r, q, hv_1y)
+    if calls.empty or puts.empty:
+        sys.exit(f"No liquid {TICKER} options near ${S:.2f} for {expiry}.")
 
-    # 4. Theoretical price using historical volatility
-    calls["bs_hist_vol"] = call_price(S, calls["strike"], T, r, hv_1y)
-    calls["diff"] = calls["market"] - calls["bs_hist_vol"]
-    calls["delta"] = call_delta(S, calls["strike"], T, r, hv_1y)
-
-    # 5. Implied volatility from each market price, plus Yahoo's value as a cross-check
-    calls["iv_solved"] = [implied_vol(p, S, k, T, r) for p, k in zip(calls["market"], calls["strike"])]
-    calls["iv_yahoo"] = calls["impliedVolatility"]
-
-    df = calls[["strike", "market", "price_source", "bs_hist_vol", "diff", "delta",
-                "iv_solved", "iv_yahoo", "volume", "openInterest"]].reset_index(drop=True)
-
-    # At-the-money implied vol: average of the two strikes closest to the stock price
-    atm = df.iloc[(df["strike"] - S).abs().argsort()[:2]]
-    atm_iv = atm["iv_solved"].mean()
-    atm_iv_yahoo = atm["iv_yahoo"].mean()
+    iv_call, iv_put = atm_iv(calls, S), atm_iv(puts, S)
+    err_call, err_put = calls["diff"].abs().mean(), puts["diff"].abs().mean()
 
     # ---------------------------------------------------------------- report
     pd.set_option("display.width", 140)
     print(f"\n{TICKER} Black-Scholes validation   (run {today})")
     print("=" * 60)
     print(f"Stock price             ${S:,.2f}")
+    print(f"Dividend yield          {q:.2%}  (trailing 12 months)")
     print(f"Risk-free rate          {r:.2%}  ({r_source})")
     print(f"Expiry                  {expiry}  ({days} days, T = {T:.4f} yr)")
     print(f"Historical vol, 1 year  {hv_1y:.2%}")
     print(f"Historical vol, 30 days {hv_30d:.2%}")
-    print(f"ATM implied vol (ours)  {atm_iv:.2%}")
-    print(f"ATM implied vol (Yahoo) {atm_iv_yahoo:.2%}")
-    print(f"Mean |market - model|   ${df['diff'].abs().mean():.2f} per share "
-          f"across {len(df)} strikes")
-    print()
+    print(f"ATM implied vol, calls  {iv_call:.2%}")
+    print(f"ATM implied vol, puts   {iv_put:.2%}")
+    print(f"Mean |market - model|   calls ${err_call:.2f}, puts ${err_put:.2f} per share")
     fmt = {"market": "{:.2f}".format, "bs_hist_vol": "{:.2f}".format, "diff": "{:+.2f}".format,
-           "delta": "{:.2f}".format, "iv_solved": "{:.1%}".format, "iv_yahoo": "{:.1%}".format}
-    print(df.to_string(formatters=fmt))
+           "delta": "{:+.2f}".format, "iv_solved": "{:.1%}".format, "iv_yahoo": "{:.1%}".format}
+    for df in (calls, puts):
+        print()
+        print(df.drop(columns="type").to_string(formatters=fmt))
 
-    gap = atm_iv - hv_1y
-    view = "MORE" if gap > 0 else "LESS"
-    print(f"\nFinding: {TICKER} at-the-money implied volatility is {atm_iv:.1%} vs "
-          f"{hv_1y:.1%} historical (1-year), so the market is pricing {view} "
-          f"future movement than the stock showed over the past year.")
+    avg_iv = (iv_call + iv_put) / 2
+    view = "MORE" if avg_iv > hv_1y else "LESS"
+    print(f"\nFinding: {TICKER} at-the-money implied volatility is {avg_iv:.1%} "
+          f"(calls {iv_call:.1%}, puts {iv_put:.1%}) vs {hv_1y:.1%} historical (1-year), "
+          f"so the market is pricing {view} future movement than the stock showed "
+          f"over the past year.")
 
-    df.to_csv(OUT_DIR / "results.csv", index=False)
+    pd.concat([calls, puts]).to_csv(OUT_DIR / "results.csv", index=False)
+    log_history({
+        "date": market_date(stock).isoformat(), "ticker": TICKER, "stock_price": S,
+        "dividend_yield": q, "risk_free_rate": r, "expiry": expiry, "days_to_expiry": days,
+        "hv_1y": hv_1y, "hv_30d": hv_30d, "atm_iv_call": iv_call, "atm_iv_put": iv_put,
+        "mean_abs_error_call": err_call, "mean_abs_error_put": err_put,
+    })
 
     plot_price_history(hist)
-    plot_theoretical_vs_market(df, S, hv_1y)
+    plot_theoretical_vs_market(calls, puts, S, hv_1y)
     plot_vol_comparison([("Historical\n(1 year)", hv_1y),
                          ("Historical\n(last 30 days)", hv_30d),
-                         ("Implied, ATM\n(our solver)", atm_iv),
-                         ("Implied, ATM\n(Yahoo)", atm_iv_yahoo)])
-    plot_vol_skew(df, S, hv_1y)
-    print(f"\nCharts saved to {PLOT_DIR}")
+                         ("Implied, ATM\ncalls", iv_call),
+                         ("Implied, ATM\nputs", iv_put)])
+    plot_vol_skew(calls, puts, S, hv_1y)
+    plot_history()
+    print(f"\nCharts saved to {PLOT_DIR}, daily log in {HISTORY_FILE.name}")
 
 
 if __name__ == "__main__":
